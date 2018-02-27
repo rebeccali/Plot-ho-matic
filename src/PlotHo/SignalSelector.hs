@@ -209,7 +209,7 @@ getMark colNum oldStates | colNum < length oldStates = Just $ oldStates !! colNu
                          | otherwise = Nothing
 
 markedAttribute :: Int -> ListViewInfo -> [AttrOp Gtk.CellRendererToggle]
-markedAttribute colNum lvi = trace "marked attribute getmark" $ case (getMark colNum (lviMarked lvi)) of
+markedAttribute colNum lvi = case (getMark colNum (lviMarked lvi)) of
   Just On           -> [ Gtk.cellToggleInconsistent := False
                   , Gtk.cellToggleActive := True
                   ]
@@ -219,7 +219,7 @@ markedAttribute colNum lvi = trace "marked attribute getmark" $ case (getMark co
   Just Inconsistent -> [ Gtk.cellToggleActive := False
                   , Gtk.cellToggleInconsistent := True
                   ]
-  Nothing -> []
+  Nothing -> trace "marked attribute getmark couldn't find mark" $ []
 
 
 toggleCheckMark :: Gtk.TreeStore ListViewInfo -> Int -> DefaultGlibString -> IO ()
@@ -331,9 +331,9 @@ updateGettersAndTitle graphInfoMVar treeStore colNum = do
           goodLvis = [x | x <- (concatMap Tree.flatten theTrees),isGoodLvi x]
           isGoodLvi lvi = mark == On && rights lvi
             where
-              mark = trace "updating getters getmark" $ case (getMark colNum (lviMarked lvi)) of
+              mark = case (getMark colNum (lviMarked lvi)) of
                 Just m -> m
-                Nothing -> Off
+                Nothing -> trace "updating getters getmark couldn't find" Off
 
               rights ListViewInfo { lviTypeOrGetter = t } = case t of
                 Right _ -> True
