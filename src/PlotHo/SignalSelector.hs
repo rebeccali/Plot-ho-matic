@@ -16,7 +16,7 @@ import Control.Monad ( unless, void, when )
 import Data.IORef ( IORef, readIORef  )
 import Data.List ( foldl', intercalate, elemIndex )
 import qualified Data.Map as M
-import Data.Maybe ( isNothing, fromJust )
+import Data.Maybe ( isNothing, fromJust, catMaybes )
 import Data.Tree ( Tree )
 import qualified Data.Tree as Tree
 import "gtk3" Graphics.UI.Gtk ( AttrOp( (:=) ) )
@@ -25,6 +25,7 @@ import System.Glib.Signals ( on )
 import System.Glib.UTFString ( DefaultGlibString )
 
 import PlotHo.PlotTypes
+import Debug.Trace
 
 data SignalSelector a
   = SignalSelector
@@ -203,20 +204,22 @@ getColumnNumber treeview col = do
 setMark ::  Int -> [MarkedState] -> MarkedState -> [MarkedState]
 setMark colNum oldStates mark = take colNum oldStates ++ [mark] ++ drop (colNum + 1) oldStates
 
-getMark :: Int -> [MarkedState] -> MarkedState
-getMark colNum oldStates = oldStates !! colNum
+getMark :: Int -> [MarkedState] -> Maybe MarkedState
+getMark colNum oldStates | colNum < length oldStates = Just $ oldStates !! colNum
+                         | otherwise = Nothing
 
 markedAttribute :: Int -> ListViewInfo -> [AttrOp Gtk.CellRendererToggle]
-markedAttribute colNum lvi = case ((lviMarked lvi) !! colNum) of
-  On           -> [ Gtk.cellToggleInconsistent := False
+markedAttribute colNum lvi = trace "marked attribute getmark" $ case (getMark colNum (lviMarked lvi)) of
+  Just On           -> [ Gtk.cellToggleInconsistent := False
                   , Gtk.cellToggleActive := True
                   ]
-  Off          -> [ Gtk.cellToggleInconsistent := False
+  Just Off          -> [ Gtk.cellToggleInconsistent := False
                   , Gtk.cellToggleActive := False
                   ]
-  Inconsistent -> [ Gtk.cellToggleActive := False
+  Just Inconsistent -> [ Gtk.cellToggleActive := False
                   , Gtk.cellToggleInconsistent := True
                   ]
+  Nothing -> []
 
 
 toggleCheckMark :: Gtk.TreeStore ListViewInfo -> Int -> DefaultGlibString -> IO ()
@@ -226,21 +229,24 @@ toggleCheckMark treeStore colNum pathStr = do
       (_, changeSelfAndChildren) = getChildrenFuns treeStore
 
   val <- Gtk.treeStoreGetValue treeStore treePath
-  let mark = getMark colNum (lviMarked val)
+  let mmark = getMark colNum (lviMarked val)
       changeMark lvi newMark = lvi { lviMarked = setMark colNum (lviMarked lvi) newMark }
-  case (val, mark) of
-    (ListViewInfo {lviTypeOrGetter = Left _ }, Off) ->
-      changeSelfAndChildren (\lvi -> changeMark lvi On) treePath
-    (ListViewInfo {lviTypeOrGetter = Left _ } ,On) ->
-      changeSelfAndChildren (\lvi -> changeMark lvi Off) treePath
-    (ListViewInfo {lviTypeOrGetter = Left _ }, Inconsistent) ->
-      changeSelfAndChildren (\lvi -> changeMark lvi On) treePath
-    (lvi@(ListViewInfo {lviTypeOrGetter = Right _}), On) ->
-      Gtk.treeStoreSetValue treeStore treePath $ changeMark lvi Off
-    (lvi@(ListViewInfo {lviTypeOrGetter = Right _}), Off) ->
-      Gtk.treeStoreSetValue treeStore treePath $ changeMark lvi On
-    (ListViewInfo {lviTypeOrGetter = Right _}, Inconsistent) ->
-      error "cell getter can't be inconsistent"
+  case mmark of
+    Nothing -> putStrLn "couldn't find mark"
+    Just mark ->
+      case (val, mark) of
+        (ListViewInfo {lviTypeOrGetter = Left _ }, Off) ->
+          changeSelfAndChildren (\lvi -> changeMark lvi On) treePath
+        (ListViewInfo {lviTypeOrGetter = Left _ } ,On) ->
+          changeSelfAndChildren (\lvi -> changeMark lvi Off) treePath
+        (ListViewInfo {lviTypeOrGetter = Left _ }, Inconsistent) ->
+          changeSelfAndChildren (\lvi -> changeMark lvi On) treePath
+        (lvi@(ListViewInfo {lviTypeOrGetter = Right _}), On) ->
+          Gtk.treeStoreSetValue treeStore treePath $ changeMark lvi Off
+        (lvi@(ListViewInfo {lviTypeOrGetter = Right _}), Off) ->
+          Gtk.treeStoreSetValue treeStore treePath $ changeMark lvi On
+        (ListViewInfo {lviTypeOrGetter = Right _}, Inconsistent) ->
+          error "cell getter can't be inconsistent"
 
 renderPlotSignal :: Int -> Gtk.TreeStore ListViewInfo -> DefaultGlibString -> IO () -> IO () -> IO ()
 renderPlotSignal colNum treeStore pathStr redraw updateGettersAndTitle' = do
@@ -264,7 +270,7 @@ renderPlotSignal colNum treeStore pathStr redraw updateGettersAndTitle' = do
             parentLvi <- Gtk.treeStoreGetValue treeStore parentPath
             let changeParentMark = setMark colNum (lviMarked parentLvi)
                 markedSiblings :: [MarkedState]
-                markedSiblings = map ((getMark colNum) . lviMarked) siblings
+                markedSiblings = trace "getmark in render plot" (catMaybes ( map ((getMark colNum) . lviMarked) siblings))
 
                 changeParent
                   | all (== On) markedSiblings =
@@ -323,8 +329,12 @@ updateGettersAndTitle graphInfoMVar treeStore colNum = do
       newGetters0 = zip names (gots <$> goodLvis)
         where
           goodLvis = [x | x <- (concatMap Tree.flatten theTrees),isGoodLvi x]
-          isGoodLvi lvi = (getMark colNum (lviMarked lvi)) == On && rights lvi
+          isGoodLvi lvi = mark == On && rights lvi
             where
+              mark = trace "updating getters getmark" $ case (getMark colNum (lviMarked lvi)) of
+                Just m -> m
+                Nothing -> Off
+
               rights ListViewInfo { lviTypeOrGetter = t } = case t of
                 Right _ -> True
                 Left _ -> False
