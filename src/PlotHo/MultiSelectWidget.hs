@@ -67,18 +67,15 @@ multiSelectWidget mplotterOptions channels numGraphs = do
 
   buttonSpawnPrefilledGraphs <- Gtk.buttonNewWithLabel "gen prefilled graphs"
   void $ on buttonSpawnPrefilledGraphs Gtk.buttonActivated $ do
-    let genGraph selector = do
-          let signalSelector =
-                SignalSelector
-                { ssTreeView = ssTreeView multiSignalSelector
-                , ssTreeStore = ssTreeStore multiSignalSelector
-                , ssSelectors = selector
-                }
-          graphWin <- newGraph plotterOptions channels (Just signalSelector)
+    let genGraph treestore selector = do
+          let stuff = case (sCheckedTreePaths selector) of
+                        Nothing -> Nothing
+                        Just a -> Just (a, treestore)
+          graphWin <- newGraph plotterOptions channels stuff
           -- add this window to the list to be killed on exit
           CC.modifyMVar_ graphWindowsToBeKilled (return . (graphWin:))
 
-    mapM_ genGraph (ssSelectors multiSignalSelector)
+    mapM_ (genGraph (ssTreeStore multiSignalSelector)) (ssSelectors multiSignalSelector)
     Gtk.mainQuit
     Gtk.widgetDestroy win
 

@@ -20,6 +20,7 @@ import qualified Graphics.Rendering.Cairo as Cairo
 import "gtk3" Graphics.UI.Gtk ( AttrOp( (:=) ) )
 import qualified "gtk3" Graphics.UI.Gtk as Gtk
 import System.Glib.Signals ( on )
+import System.Glib.UTFString ( DefaultGlibString )
 import Text.Printf ( printf )
 import Graphics.Rendering.Chart ( RectSize )
 
@@ -54,8 +55,8 @@ toElement' index channel = do
 
 
 -- make a new graph window
-newGraph :: PlotterOptions -> [Channel] -> Maybe (SignalSelector Selector) -> IO Gtk.Window
-newGraph options channels mSignalSelector = do
+newGraph :: PlotterOptions -> [Channel] -> Maybe (CC.MVar [DefaultGlibString], Gtk.TreeStore ListViewInfo) -> IO Gtk.Window
+newGraph options channels mCheckedTreePathsMVar = do
   win <- Gtk.windowNew
 
   elements <- zipWithM (\k (Channel c) -> Element <$> toElement' k c) [0..] channels
@@ -87,7 +88,7 @@ newGraph options channels mSignalSelector = do
         void $ CC.swapMVar needRedrawMVar True
         Gtk.postGUIAsync (Gtk.widgetQueueDraw chartCanvas)
 
-  signalSelector <- newSignalSelectorArea elements redraw mSignalSelector
+  signalSelector <- newSignalSelectorArea elements redraw mCheckedTreePathsMVar
 
   largestRangeMVar <- CC.newMVar (XY defaultHistoryRange defaultHistoryRange)
   optionsWidget <- makeOptionsWidget options largestRangeMVar redraw

@@ -13,8 +13,8 @@ module PlotHo.SignalSelector
 
 import qualified Control.Concurrent as CC
 import Control.Monad ( unless, void, when )
-import Data.IORef ( IORef, readIORef  )
-import Data.List ( foldl', intercalate, elemIndex )
+import Data.IORef ( IORef, readIORef, writeIORef )
+import Data.List ( foldl', intercalate, elemIndex, delete )
 import qualified Data.Map as M
 import Data.Maybe ( isNothing, fromJust, catMaybes )
 import Data.Tree ( Tree )
@@ -38,7 +38,7 @@ data Selector
  = Selector
   { sRebuildSignalTree :: forall a . Element' a -> SignalTree a -> IO ()
   , sToPlotValues :: IO (Maybe String, [(String, [[(Double, Double)]])])
-  , sColumnNumber :: Int -- ^ must be assigned after tree is built - a bit hacky :(
+  , sCheckedTreePaths :: Maybe (CC.MVar [DefaultGlibString])
   }
 
 newMultiSignalSelectorArea :: [Element] -> Int -> IO (SignalSelector [Selector])
@@ -53,14 +53,14 @@ newMultiSignalSelectorArea elems numCols = do
   (setSignalAttrAndRender, _) <- signalColumn treeStore treeview "signal"
   -- add some columns
 
-  attrAndCol <- mapM (\n -> checkMarkColumn treeStore treeview ("Plot " ++ show n)) [1,2..numCols]
-  let (setAttrAndRenders, columns) = unzip $ attrAndCol
+  attrAndColAndMVar <- mapM (\n -> checkMarkColumn treeStore treeview ("Plot " ++ show n)) [1,2..numCols]
+  let (setAttrAndRenders, columns, checkedTreePathsMVar) = unzip3 $ attrAndColAndMVar
   -- set the attributes
   sequence_ setAttrAndRenders
   setSignalAttrAndRender
 
-  let toSelector :: Gtk.TreeViewColumn -> IO Selector
-      toSelector column = do
+  let toSelector :: (Gtk.TreeViewColumn, CC.MVar [DefaultGlibString]) -> IO Selector
+      toSelector (column, checkedMVar) = do
         graphInfoMVar <- CC.newMVar (Nothing, [])
         colNum <- getColumnNumber treeview column
         let updateGettersAndTitle' = updateGettersAndTitle graphInfoMVar treeStore colNum
@@ -68,9 +68,10 @@ newMultiSignalSelectorArea elems numCols = do
           Selector
           { sRebuildSignalTree = rebuildSignalTree treeStore updateGettersAndTitle' treeview
           , sToPlotValues = toValues graphInfoMVar
-          , sColumnNumber = colNum
+          , sCheckedTreePaths = Just checkedMVar
           }
-  selectors <- mapM toSelector columns
+
+  selectors <- mapM toSelector $ zip columns checkedTreePathsMVar
 
   return $
     SignalSelector
@@ -80,14 +81,12 @@ newMultiSignalSelectorArea elems numCols = do
     }
 
 newSignalSelectorArea :: [Element] -> IO ()
-                      -> Maybe (SignalSelector Selector)
+                      -> Maybe (CC.MVar [DefaultGlibString], Gtk.TreeStore ListViewInfo)
                       -> IO (SignalSelector Selector)
-newSignalSelectorArea elems redraw mSigSelector = do
+newSignalSelectorArea elems redraw mCheckedTreePathsMVar = do
   -- mvar with all the user input
   graphInfoMVar <- CC.newMVar (Nothing, [])
-  treeStore <- case (ssTreeStore <$> mSigSelector) of
-    Just t -> return t
-    Nothing -> Gtk.treeStoreNew $ initialForest elems 2
+  treeStore <- Gtk.treeStoreNew $ initialForest elems 2
   treeview <- Gtk.treeViewNewWithModel treeStore
 
   Gtk.treeViewSetHeadersVisible treeview True
@@ -105,9 +104,7 @@ newSignalSelectorArea elems redraw mSigSelector = do
   appendColumn treeview colVisible
 
   -- Now, we can set the attributes and render since the order of the columns is set.
-  colVisibleNumber <- case ((sColumnNumber . ssSelectors) <$> mSigSelector) of
-   Nothing -> getColumnNumber treeview colVisible
-   Just i -> return i
+  colVisibleNumber <- getColumnNumber treeview colVisible
   let updateGettersAndTitle' = updateGettersAndTitle graphInfoMVar treeStore colVisibleNumber
   Gtk.cellLayoutSetAttributes colVisible rendererVisible treeStore $ \lvi -> (markedAttribute colVisibleNumber lvi)
 
@@ -115,15 +112,28 @@ newSignalSelectorArea elems redraw mSigSelector = do
 
   _ <- on rendererVisible Gtk.cellToggled $ \pathStr -> renderPlotSignal colVisibleNumber treeStore pathStr redraw updateGettersAndTitle'
 
+  -- now it's all built, so we can prefill some checkboxes
+  let rebuildSignalTree' = rebuildSignalTree treeStore updateGettersAndTitle' treeview
+  case mCheckedTreePathsMVar of
+    Nothing -> return ()
+    Just (checkedTreePathsMVar, _) -> do
+      checkedTreePaths <- CC.readMVar checkedTreePathsMVar
+      putStrLn $ show checkedTreePaths
+      updateGettersAndTitle'
+      let render' pathstr = renderPlotSignal colVisibleNumber treeStore pathstr redraw updateGettersAndTitle'
+      -- rebuild the signal tree!
+      mapM_ (\(Element e) -> stageDataFromElement' rebuildSignalTree' e) elems
+      mapM_ (turnMarkOnTreePath treeStore colVisibleNumber render') checkedTreePaths
+
   return
     SignalSelector
     { ssTreeView = treeview
     , ssTreeStore = treeStore
     , ssSelectors =
       Selector
-      { sRebuildSignalTree = rebuildSignalTree treeStore updateGettersAndTitle' treeview
+      { sRebuildSignalTree = rebuildSignalTree'
       , sToPlotValues = toValues graphInfoMVar
-      , sColumnNumber = colVisibleNumber
+      , sCheckedTreePaths = Nothing
       }
     }
 
@@ -145,9 +155,10 @@ signalColumn treeStore treeview columnName = do
 
 
 checkMarkColumn :: forall a . Gtk.TreeViewClass a => Gtk.TreeStore ListViewInfo -> a -> String
-                -> IO (IO (), Gtk.TreeViewColumn)
+                -> IO (IO (), Gtk.TreeViewColumn, CC.MVar [DefaultGlibString])
 checkMarkColumn treeStore treeview columnName = do
   colCheckMark <- Gtk.treeViewColumnNew
+  checkedTreePathsMVar <- CC.newMVar []
   Gtk.treeViewColumnSetTitle colCheckMark columnName
   rendererCheckMark <- Gtk.cellRendererToggleNew
   Gtk.treeViewColumnPackStart colCheckMark rendererCheckMark True
@@ -156,42 +167,40 @@ checkMarkColumn treeStore treeview columnName = do
       setAttributeAndRender = do
         colNum <- getColumnNumber treeview colCheckMark
         Gtk.cellLayoutSetAttributes colCheckMark rendererCheckMark treeStore $ \lvi -> (markedAttribute colNum lvi)
-        _ <- on rendererCheckMark Gtk.cellToggled $ \pathStr -> toggleCheckMark treeStore colNum pathStr
+        _ <- on rendererCheckMark Gtk.cellToggled $ \pathStr -> toggleCheckMarkAndTreePath treeStore colNum pathStr checkedTreePathsMVar
         return ()
     -- update which y axes are CheckMark
-  return (setAttributeAndRender, colCheckMark)
+  return (setAttributeAndRender, colCheckMark, checkedTreePathsMVar)
 
 appendColumn :: forall a . Gtk.TreeViewClass a => a -> Gtk.TreeViewColumn -> IO ()
 appendColumn treeview col = do
   void $ Gtk.treeViewAppendColumn treeview col
   --TODO(rebecca): append proper number of columns to lvi? maybe
 
+turnMarkOnTreePath :: Gtk.TreeStore ListViewInfo -> Int -> (DefaultGlibString -> IO ()) -> DefaultGlibString -> IO ()
+turnMarkOnTreePath _ _ render' pathStr = render' pathStr
 
-initialForest :: [Element] -> Int -> [Tree ListViewInfo]
-initialForest elems numCols = map (\(Element e) -> toNode e)  elems
-  where
-    toNode :: Element' a -> Tree ListViewInfo
-    toNode element =
-      Tree.Node
-      { Tree.rootLabel =
-          ListViewInfo
-          { lviName = [chanName (eChannel element)]
-          , lviMarked = take numCols $ repeat Off
-          , lviTypeOrGetter = Left ""
-          , lviPlotValueRef = ePlotValueRef element
-          }
-      , Tree.subForest = []
-      }
 
-showName :: Either String b -> [String] -> String
--- show a getter name
-showName (Right _) (name:_) = name
-showName (Right _) [] = error "showName on field got an empty list"
--- show a parent without type info
-showName (Left "") (name:_) = name
--- show a parent with type info
-showName (Left typeName) (name:_) = name ++ " (" ++ typeName ++ ")"
-showName (Left _) [] = error "showName on parent got an empty list"
+stageDataFromElement' :: forall a . (Element' a -> SignalTree a -> IO ()) -> Element' a -> IO ()
+stageDataFromElement' rebuildSignalTree' element = do
+  let msgStore = eMsgStore element
+  -- get the latest data, just block if they're not available
+  mdatalog <- CC.takeMVar msgStore
+  case mdatalog of
+    -- no data yet, do nothing
+    Nothing -> CC.putMVar msgStore mdatalog
+    Just (datalog, msignalTree) -> do
+      case msignalTree of
+        -- No new signal tree, no action necessary
+        Nothing -> return ()
+        -- If there is a new signal tree, we have to merge it with the old one.
+        Just newSignalTree -> rebuildSignalTree' element newSignalTree
+
+      -- write the data to the IORef so that the getters get the right stuff
+      writeIORef (ePlotValueRef element) datalog
+
+      -- Put the data back. Put Nothing to signify that the signal tree is up to date.
+      CC.putMVar msgStore (Just (datalog, msignalTree))
 
 getColumnNumber :: forall a . Gtk.TreeViewClass a => a -> Gtk.TreeViewColumn -> IO Int
 getColumnNumber treeview col = do
@@ -247,6 +256,16 @@ toggleCheckMark treeStore colNum pathStr = do
           Gtk.treeStoreSetValue treeStore treePath $ changeMark lvi On
         (ListViewInfo {lviTypeOrGetter = Right _}, Inconsistent) ->
           error "cell getter can't be inconsistent"
+
+toggleCheckMarkAndTreePath :: Gtk.TreeStore ListViewInfo -> Int -> DefaultGlibString -> CC.MVar [DefaultGlibString] -> IO ()
+toggleCheckMarkAndTreePath treeStore colNum pathStr checkedTreePathsMVar = do
+  toggleCheckMark treeStore colNum pathStr
+  -- check if pathStr is in mvar. If not, add. If it is, remove.
+  CC.modifyMVar_ checkedTreePathsMVar $ \paths -> case (elem pathStr) paths of
+      True -> return $ delete pathStr paths
+      False -> return (pathStr:paths)
+
+
 
 renderPlotSignal :: Int -> Gtk.TreeStore ListViewInfo -> DefaultGlibString -> IO () -> IO () -> IO ()
 renderPlotSignal colNum treeStore pathStr redraw updateGettersAndTitle' = do
@@ -505,3 +524,31 @@ splitPartialCommonPrefix (wholePrefixes, getters)
     commonPrefix (x:xs) (y:ys)
       | x == y = x : commonPrefix xs ys
     commonPrefix _ _ = []
+
+
+
+initialForest :: [Element] -> Int -> [Tree ListViewInfo]
+initialForest elems numCols = map (\(Element e) -> toNode e)  elems
+  where
+    toNode :: Element' a -> Tree ListViewInfo
+    toNode element =
+      Tree.Node
+      { Tree.rootLabel =
+          ListViewInfo
+          { lviName = [chanName (eChannel element)]
+          , lviMarked = take numCols $ repeat Off
+          , lviTypeOrGetter = Left ""
+          , lviPlotValueRef = ePlotValueRef element
+          }
+      , Tree.subForest = []
+      }
+
+showName :: Either String b -> [String] -> String
+-- show a getter name
+showName (Right _) (name:_) = name
+showName (Right _) [] = error "showName on field got an empty list"
+-- show a parent without type info
+showName (Left "") (name:_) = name
+-- show a parent with type info
+showName (Left typeName) (name:_) = name ++ " (" ++ typeName ++ ")"
+showName (Left _) [] = error "showName on parent got an empty list"
